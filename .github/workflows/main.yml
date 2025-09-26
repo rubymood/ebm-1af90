@@ -1,0 +1,83 @@
+name: Deploy to Netlify with MongoDB Cluster
+
+on:
+  workflow_dispatch: # manuálisan indítható
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate random password for MongoDB user
+        id: generate
+        run: |
+          PASSWORD=$(openssl rand -base64 16)
+          echo "MONGO_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+
+      - name: Create MongoDB Cluster
+        run: |
+          CLUSTER_NAME="netlify-cluster-$(date +%s)"
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+
+          curl -u "${{ secrets.MONGODB_ATLAS_PUBLIC_KEY }}:${{ secrets.MONGODB_ATLAS_PRIVATE_KEY }}" \
+            --digest \
+            -H "Content-Type: application/json" \
+            -X POST "https://cloud.mongodb.com/api/atlas/v1.0/groups/${{ secrets.MONGODB_ATLAS_PROJECT_ID }}/clusters" \
+            -d '{
+              "name": "'"$CLUSTER_NAME"'",
+              "providerSettings": {
+                "providerName": "AWS",
+                "regionName": "EU_CENTRAL_1",
+                "instanceSizeName": "M0"
+              }
+            }'
+
+      - name: Wait for cluster to be ready
+        run: |
+          echo "Waiting for cluster to become available..."
+          for i in {1..30}; do
+            STATUS=$(curl -u "${{ secrets.MONGODB_ATLAS_PUBLIC_KEY }}:${{ secrets.MONGODB_ATLAS_PRIVATE_KEY }}" \
+              --digest \
+              -s "https://cloud.mongodb.com/api/atlas/v1.0/groups/${{ secrets.MONGODB_ATLAS_PROJECT_ID }}/clusters/$CLUSTER_NAME" | jq -r '.stateName')
+            if [ "$STATUS" = "IDLE" ]; then
+              echo "Cluster is ready"
+              break
+            fi
+            echo "Cluster status: $STATUS, waiting..."
+            sleep 20
+          done
+
+      - name: Create MongoDB user
+        run: |
+          curl -u "${{ secrets.MONGODB_ATLAS_PUBLIC_KEY }}:${{ secrets.MONGODB_ATLAS_PRIVATE_KEY }}" \
+            --digest \
+            -H "Content-Type: application/json" \
+            -X POST "https://cloud.mongodb.com/api/atlas/v1.0/groups/${{ secrets.MONGODB_ATLAS_PROJECT_ID }}/databaseUsers" \
+            -d '{
+              "databaseName": "admin",
+              "roles": [{"roleName": "readWriteAnyDatabase","databaseName":"admin"}],
+              "username": "netlify_user",
+              "password": "'"${{ env.MONGO_PASSWORD }}"'"
+            }'
+
+      - name: Construct MongoDB URI
+        run: |
+          URI="mongodb+srv://netlify_user:${{ env.MONGO_PASSWORD }}@${{ env.CLUSTER_NAME }}.mongodb.net/appdb?retryWrites=true&w=majority"
+          echo "MONGODB_URI=$URI" >> $GITHUB_ENV
+
+      - name: Set MongoDB URI in Netlify
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.NETLIFY_AUTH_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"key":"MONGODB_URI","values":["'"${{ env.MONGODB_URI }}"'"]}' \
+            https://api.netlify.com/api/v1/sites/${{ secrets.NETLIFY_SITE_ID }}/env
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run seed script
+        run: node seed.js
